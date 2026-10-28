@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/redhat-openshift-ecosystem/openshift-preflight/internal/check"
+	"github.com/redhat-openshift-ecosystem/openshift-preflight/internal/formatters"
 )
 
 // localRoundTripper serves requests directly from an in-process http.Handler,
@@ -160,12 +162,26 @@ func tarDir(t *testing.T, src, tarPath string) {
 	}
 }
 
-// fakePyxisGraphQLHandler responds to the CertifiedImagesContainingLayers
-// GraphQL query, simulating Pyxis finding (or not finding) a certified UBI
-// image containing one of the submitted layers.
-func fakePyxisGraphQLHandler(found bool) http.HandlerFunc {
+// fakePyxisHandler responds to both REST calls made against a revalidation
+// pyxisClient: GetProject (used to detect a scratch exception) and the
+// CertifiedImagesContainingLayers GraphQL query (used to revalidate
+// BasedOnUbi for non-scratch projects). scratch controls the project's
+// container.type; found controls whether the GraphQL query finds a
+// certified UBI image containing one of the submitted layers.
+func fakePyxisHandler(found, scratch bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+
+		if strings.Contains(r.URL.Path, "/projects/certification/id/") {
+			containerType := ""
+			if scratch {
+				containerType = "scratch"
+			}
+			fmt.Fprintf(w, `{"_id":"proj123","name":"test-project","project_status":"active","container":{"type":%q}}`, containerType)
+			return
+		}
+
+		// Otherwise, this is the CertifiedImagesContainingLayers GraphQL query.
 		if !found {
 			_, _ = w.Write([]byte(`{"data":{"find_images":{"error":null,"total":0,"page":0,"data":[]}}}`))
 			return
@@ -189,6 +205,32 @@ func fakePyxisGraphQLHandler(found bool) http.HandlerFunc {
 	}
 }
 
+// fakePyxisGetProjectErrorHandler always returns a 500 for the GetProject
+// REST call, simulating a failure to reach Pyxis before BasedOnUbi
+// revalidation (or the scratch-exception check) can even be attempted.
+func fakePyxisGetProjectErrorHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"detail":"simulated pyxis outage"}`))
+	}
+}
+
+// fakePyxisLayersQueryErrorHandler succeeds at GetProject for a non-scratch
+// project, but returns a 500 for the CertifiedImagesContainingLayers
+// GraphQL query, simulating Pyxis becoming unreachable partway through a
+// run (after the scratch-exception check, during BasedOnUbi revalidation).
+func fakePyxisLayersQueryErrorHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/projects/certification/id/") {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"_id":"proj123","name":"test-project","project_status":"active","container":{"type":""}}`)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"detail":"simulated pyxis outage"}`))
+	}
+}
+
 // TestRun_AlwaysExtractsToAPrivateTempDir proves Run() never extracts into
 // the tarball's own directory, so a rerun can't clobber a pre-existing
 // results.json from a previously-successful revalidation.
@@ -209,7 +251,7 @@ func TestRun_AlwaysExtractsToAPrivateTempDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fakeClient := &http.Client{Transport: localRoundTripper{handler: fakePyxisGraphQLHandler(true)}}
+	fakeClient := &http.Client{Transport: localRoundTripper{handler: fakePyxisHandler(true, false)}}
 
 	// Calls the unexported run() directly (rather than Run()) so the
 	// extraction directory can be inspected below before it's cleaned up -
@@ -256,7 +298,7 @@ func TestRun_EndToEnd_BasedOnUbiPasses(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fakeClient := &http.Client{Transport: localRoundTripper{handler: fakePyxisGraphQLHandler(true)}}
+	fakeClient := &http.Client{Transport: localRoundTripper{handler: fakePyxisHandler(true, false)}}
 
 	// Calls the unexported run() directly (rather than Run()) so the
 	// extracted/updated artifacts can be inspected below before they're
@@ -336,7 +378,7 @@ func TestRun_EndToEnd_BasedOnUbiFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fakeClient := &http.Client{Transport: localRoundTripper{handler: fakePyxisGraphQLHandler(false)}}
+	fakeClient := &http.Client{Transport: localRoundTripper{handler: fakePyxisHandler(false, false)}}
 
 	// Calls the unexported run() directly (rather than Run()) so
 	// results.json can be inspected below before it's cleaned up - Run()
@@ -381,6 +423,189 @@ func TestRun_EndToEnd_BasedOnUbiFails(t *testing.T) {
 	}
 }
 
+// TestRun_EndToEnd_ScratchProject_RemovesBasedOnUbi proves that when the
+// certification project has a scratch exception, BasedOnUbi is removed from
+// results.json entirely (never revalidated), and the overall result passes
+// based on the other, already-offline-completed checks alone.
+func TestRun_EndToEnd_ScratchProject_RemovesBasedOnUbi(t *testing.T) {
+	workDir := t.TempDir()
+	tarPath := buildFakeArtifactsTar(t, workDir)
+
+	logFile := filepath.Join(workDir, "this-run.log")
+	if err := os.WriteFile(logFile, []byte("this invocation's own log\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// found=false would normally fail BasedOnUbi, but scratch=true means the
+	// GraphQL layers query is never even reached.
+	fakeClient := &http.Client{Transport: localRoundTripper{handler: fakePyxisHandler(false, true)}}
+
+	// Calls the unexported run() directly (rather than Run()) so
+	// results.json can be inspected below before it's cleaned up - Run()
+	// always removes extractDir before returning.
+	extractDir, summary, err := run(context.Background(), Options{
+		ArtifactsTarPath:         tarPath,
+		LogFile:                  logFile,
+		PyxisHost:                "fake-pyxis.example.com",
+		PyxisHTTPClient:          fakeClient,
+		CertificationComponentID: "abc123",
+		PyxisClient:              newSuccessfulFakePyxisClient(),
+	})
+	defer os.RemoveAll(extractDir)
+	if err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+
+	if !summary.ScratchExempt {
+		t.Errorf("summary.ScratchExempt = false, want true")
+	}
+	if summary.BasedOnUbiPassed {
+		t.Errorf("summary.BasedOnUbiPassed = true, want false (meaningless/unset for scratch-exempt projects)")
+	}
+
+	got, err := ReadResults(summary.ExtractDir)
+	if err != nil {
+		t.Fatalf("ReadResults() error = %v", err)
+	}
+
+	for _, bucket := range [][]formatters.CheckExecutionInfo{got.Results.Passed, got.Results.Failed, got.Results.Errors, got.Results.Warnings} {
+		for _, entry := range bucket {
+			if entry.Name == basedOnUbiCheckName {
+				t.Errorf("expected BasedOnUbi to be removed entirely, found it in %+v", entry)
+			}
+		}
+	}
+
+	// The pre-existing HasLicense pass, produced entirely offline, must survive untouched.
+	var foundHasLicense bool
+	for _, entry := range got.Results.Passed {
+		if entry.Name == "HasLicense" {
+			foundHasLicense = true
+		}
+	}
+	if !foundHasLicense {
+		t.Errorf("expected pre-existing HasLicense pass to be preserved, got %+v", got.Results.Passed)
+	}
+
+	// BasedOnUbi was the only error/failure in the fixture, so once it's
+	// removed the overall result should pass.
+	if !got.Passed {
+		t.Errorf("results.json passed = false, want true once BasedOnUbi is removed")
+	}
+}
+
+// TestRun_EndToEnd_ScratchProject_OverallFailsIfOtherChecksFailed proves
+// that removing BasedOnUbi for a scratch-exempt project doesn't mask
+// unrelated, still-failing checks.
+func TestRun_EndToEnd_ScratchProject_OverallFailsIfOtherChecksFailed(t *testing.T) {
+	workDir := t.TempDir()
+	srcDir := filepath.Join(workDir, "src")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	writeJSON(t, filepath.Join(srcDir, check.DefaultCertImageFilename), map[string]any{
+		"docker_image_digest": "sha256:deadbeef",
+		"raw_config":          fakeRawConfig,
+	})
+	writeJSON(t, filepath.Join(srcDir, check.DefaultTestResultsFilename), map[string]any{
+		"image":        "quay.io/example/myapp:latest",
+		"passed":       false,
+		"test_library": map[string]any{"name": "preflight", "version": "1.0.0"},
+		"results": map[string]any{
+			"passed": []map[string]any{},
+			"failed": []map[string]any{
+				{"name": "HasUniqueTag", "elapsed_time": 1.0, "description": "has a unique tag"},
+			},
+			"errors": []map[string]any{
+				{"name": basedOnUbiCheckName, "elapsed_time": 5.0, "description": basedOnUbiCheck.Metadata().Description},
+			},
+			"warning": []map[string]any{},
+		},
+	})
+	if err := os.WriteFile(filepath.Join(srcDir, "preflight.log"), []byte("fake preflight log\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tarPath := filepath.Join(workDir, check.DefaultArtifactsTarFileName)
+	tarDir(t, srcDir, tarPath)
+
+	logFile := filepath.Join(workDir, "this-run.log")
+	if err := os.WriteFile(logFile, []byte("this invocation's own log\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fakeClient := &http.Client{Transport: localRoundTripper{handler: fakePyxisHandler(false, true)}}
+
+	extractDir, summary, err := run(context.Background(), Options{
+		ArtifactsTarPath:         tarPath,
+		LogFile:                  logFile,
+		PyxisHost:                "fake-pyxis.example.com",
+		PyxisHTTPClient:          fakeClient,
+		CertificationComponentID: "abc123",
+		PyxisClient:              newSuccessfulFakePyxisClient(),
+	})
+	defer os.RemoveAll(extractDir)
+	if err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+
+	got, err := ReadResults(summary.ExtractDir)
+	if err != nil {
+		t.Fatalf("ReadResults() error = %v", err)
+	}
+
+	if got.Passed {
+		t.Errorf("results.json passed = true, want false because HasUniqueTag is still failing")
+	}
+	if len(got.Results.Failed) != 1 || got.Results.Failed[0].Name != "HasUniqueTag" {
+		t.Errorf("expected only the pre-existing HasUniqueTag failure to remain, got %+v", got.Results.Failed)
+	}
+	if len(got.Results.Errors) != 0 {
+		t.Errorf("expected BasedOnUbi to have been removed from Errors, got %+v", got.Results.Errors)
+	}
+}
+
+// TestRun_EndToEnd_RevalidateBasedOnUbiFails proves that a failure to reach
+// Pyxis during BasedOnUbi revalidation (after the scratch-exception check
+// already succeeded for a non-scratch project) is surfaced as an error.
+func TestRun_EndToEnd_RevalidateBasedOnUbiFails(t *testing.T) {
+	workDir := t.TempDir()
+	tarPath := buildFakeArtifactsTar(t, workDir)
+
+	fakeClient := &http.Client{Transport: localRoundTripper{handler: fakePyxisLayersQueryErrorHandler()}}
+
+	_, _, err := run(context.Background(), Options{
+		ArtifactsTarPath:         tarPath,
+		PyxisHost:                "fake-pyxis.example.com",
+		PyxisHTTPClient:          fakeClient,
+		CertificationComponentID: "abc123",
+	})
+	if err == nil {
+		t.Fatal("expected an error when the BasedOnUbi layers query fails, got nil")
+	}
+}
+
+// TestRun_EndToEnd_GetProjectFails proves that a failure to reach Pyxis
+// while checking for a scratch exception is surfaced as an error, rather
+// than silently falling through to revalidating BasedOnUbi anyway.
+func TestRun_EndToEnd_GetProjectFails(t *testing.T) {
+	workDir := t.TempDir()
+	tarPath := buildFakeArtifactsTar(t, workDir)
+
+	fakeClient := &http.Client{Transport: localRoundTripper{handler: fakePyxisGetProjectErrorHandler()}}
+
+	_, _, err := run(context.Background(), Options{
+		ArtifactsTarPath:         tarPath,
+		PyxisHost:                "fake-pyxis.example.com",
+		PyxisHTTPClient:          fakeClient,
+		CertificationComponentID: "abc123",
+	})
+	if err == nil {
+		t.Fatal("expected an error when the scratch-exception project lookup fails, got nil")
+	}
+}
+
 // TestRun_EndToEnd_WithSubmit drives the full submit-offline-artifacts
 // pipeline using an injected fake lib.PyxisClient (via Options.PyxisClient)
 // so the submission path is exercised without any real Pyxis network calls.
@@ -395,7 +620,7 @@ func TestRun_EndToEnd_WithSubmit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fakeClient := &http.Client{Transport: localRoundTripper{handler: fakePyxisGraphQLHandler(true)}}
+	fakeClient := &http.Client{Transport: localRoundTripper{handler: fakePyxisHandler(true, false)}}
 
 	summary, err := Run(context.Background(), Options{
 		ArtifactsTarPath:         tarPath,
@@ -425,7 +650,7 @@ func TestRun_CleansUpExtractDirEvenWhenSubmitFails(t *testing.T) {
 	workDir := t.TempDir()
 	tarPath := buildFakeArtifactsTar(t, workDir)
 
-	fakeClient := &http.Client{Transport: localRoundTripper{handler: fakePyxisGraphQLHandler(true)}}
+	fakeClient := &http.Client{Transport: localRoundTripper{handler: fakePyxisHandler(true, false)}}
 	fakePC := &fakePyxisClient{getProjectErr: errors.New("simulated submission failure")}
 
 	summary, err := Run(context.Background(), Options{
@@ -454,7 +679,7 @@ func TestRun_EndToEnd_SubmitFails(t *testing.T) {
 	workDir := t.TempDir()
 	tarPath := buildFakeArtifactsTar(t, workDir)
 
-	fakeClient := &http.Client{Transport: localRoundTripper{handler: fakePyxisGraphQLHandler(true)}}
+	fakeClient := &http.Client{Transport: localRoundTripper{handler: fakePyxisHandler(true, false)}}
 	fakePC := &fakePyxisClient{getProjectErr: errors.New("simulated submission failure")}
 
 	// Calls the unexported run() directly (rather than Run()) so
@@ -569,7 +794,7 @@ func TestRun_EndToEnd_MissingResultsJSON(t *testing.T) {
 	tarPath := filepath.Join(workDir, check.DefaultArtifactsTarFileName)
 	tarDir(t, srcDir, tarPath)
 
-	fakeClient := &http.Client{Transport: localRoundTripper{handler: fakePyxisGraphQLHandler(true)}}
+	fakeClient := &http.Client{Transport: localRoundTripper{handler: fakePyxisHandler(true, false)}}
 
 	_, err := Run(context.Background(), Options{
 		ArtifactsTarPath: tarPath,

@@ -84,6 +84,15 @@ func removeByName(entries []formatters.CheckExecutionInfo, name string) []format
 	return out
 }
 
+// RemoveCheckResult drops any prior entry for c from r entirely, rather than
+// replacing it with a fresh passed/failed outcome, and recalculates the
+// top-level Passed field. Used when a check no longer applies at all - e.g.
+// BasedOnUbi for a certification project with a scratch exception.
+func RemoveCheckResult(r *formatters.UserResponse, c check.Check) {
+	removeCheckByName(r, c.Name())
+	r.Passed = len(r.Results.Failed) == 0 && len(r.Results.Errors) == 0
+}
+
 // ApplyCheckResult removes any prior entry for c from r, inserts a fresh one
 // reflecting the outcome of revalidating c, and recalculates the top-level
 // Passed field. Generic over any check.Check for reuse by future checks.
