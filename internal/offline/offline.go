@@ -29,6 +29,12 @@ type layerHashChecker interface {
 	CertifiedImagesContainingLayers(ctx context.Context, uncompressedLayerHashes []cranev1.Hash) ([]pyxis.CertImage, error)
 }
 
+// projectFetcher is satisfied by *pyxis.pyxisClient. Declared locally so
+// unit tests can fake just the method exercised by isScratchProject.
+type projectFetcher interface {
+	GetProject(ctx context.Context) (*pyxis.CertProject, error)
+}
+
 // Options configures a submit-offline-artifacts execution.
 type Options struct {
 	// ArtifactsTarPath is the path to the artifacts.tar produced by
@@ -59,9 +65,19 @@ type Options struct {
 // Summary describes what happened during a submit-offline-artifacts execution, for
 // reporting back to the user.
 type Summary struct {
-	ExtractDir       string
+	ExtractDir string
+
+	// BasedOnUbiPassed is only meaningful when ScratchExempt is false:
+	// scratch-exempt projects have their BasedOnUbi result removed instead
+	// of revalidated, so this stays false for them.
 	BasedOnUbiPassed bool
-	Submitted        bool
+
+	// ScratchExempt reports whether the certification project has a scratch
+	// exception, per pyxis.CertProject.ScratchProject. When true, BasedOnUbi
+	// is removed from results.json instead of being revalidated.
+	ScratchExempt bool
+
+	Submitted bool
 }
 
 // Run extracts artifacts.tar, revalidates the checks that couldn't complete
@@ -122,28 +138,44 @@ func run(ctx context.Context, opts Options) (extractDir string, summary *Summary
 		httpClient,
 	)
 
-	basedOnUbiPassed, err := revalidateBasedOnUbi(ctx, pyxisClient, diffIDs)
+	// Offline, the project's policy exception can't be checked, so BasedOnUbi
+	// always runs and lands in results.json as an error even for scratch
+	// projects. Check it here instead: scratch projects never need to be
+	// based on UBI, so their BasedOnUbi result is removed rather than
+	// revalidated; every other project continues being revalidated as before.
+	scratchExempt, err := isScratchProject(ctx, pyxisClient)
 	if err != nil {
 		return extractDir, nil, err
 	}
-	logger.Info("revalidated BasedOnUbi", "passed", basedOnUbiPassed)
 
 	results, err := ReadResults(extractDir)
 	if err != nil {
 		return extractDir, nil, err
 	}
 
-	ApplyCheckResult(results, basedOnUbiCheck, basedOnUbiPassed)
+	var basedOnUbiPassed bool
+	if scratchExempt {
+		logger.Info("certification project has a scratch exception; removing BasedOnUbi instead of revalidating it")
+		RemoveCheckResult(results, basedOnUbiCheck)
+	} else {
+		basedOnUbiPassed, err = revalidateBasedOnUbi(ctx, pyxisClient, diffIDs)
+		if err != nil {
+			return extractDir, nil, err
+		}
+		logger.Info("revalidated BasedOnUbi", "passed", basedOnUbiPassed)
+		ApplyCheckResult(results, basedOnUbiCheck, basedOnUbiPassed)
+	}
 
 	if err := WriteResults(extractDir, results); err != nil {
 		//coverage:ignore
 		return extractDir, nil, err
 	}
-	logger.Info("results.json updated with revalidated BasedOnUbi outcome", "overallPassed", results.Passed)
+	logger.Info("results.json updated", "overallPassed", results.Passed, "scratchExempt", scratchExempt)
 
 	summary = &Summary{
 		ExtractDir:       extractDir,
 		BasedOnUbiPassed: basedOnUbiPassed,
+		ScratchExempt:    scratchExempt,
 	}
 
 	if err := submit(ctx, extractDir, opts); err != nil {
@@ -187,6 +219,20 @@ func diffIDsFromCertImage(certImage *pyxis.CertImage) ([]cranev1.Hash, error) {
 	}
 
 	return configFile.RootFS.DiffIDs, nil
+}
+
+// isScratchProject reports whether the certification project associated
+// with client has a scratch exception, per pyxis.CertProject.ScratchProject.
+func isScratchProject(ctx context.Context, client projectFetcher) (bool, error) {
+	certProject, err := client.GetProject(ctx)
+	if err != nil {
+		return false, fmt.Errorf("could not retrieve certification project: %w", err)
+	}
+	if certProject == nil {
+		return false, fmt.Errorf("no certification project was returned from pyxis")
+	}
+
+	return certProject.ScratchProject(), nil
 }
 
 // revalidateBasedOnUbi mirrors internal/policy/container.BasedOnUBICheck.validate:
